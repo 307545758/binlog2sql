@@ -1,15 +1,15 @@
 binlog2sql
 ===
 对binlog2sql进行了二次开发，加入了以下功能：
-- 生成原始sql时，默认输出后添加一份到redis队列（使用rq库），达到类似“同步”、“订阅”的目的。
-  加入选项 `--dsn-dest h=host1,P=3306,u=user1,p=pass1` 来指定目标库的地址，并将`INSERT INTO`换成了`REPLACE INTO`，程序起来之后会暂存消息在队列，需要的时候执行 `rq worker` 开始在目标库消费（回放）。
-  指定redis地址 export REDIS_URL='redis://:pass1@ip_addr1:6379/1'
-  关于 rq 的使用请参考 https://github.com/nvie/rq
+- 生成原始sql时，默认输出后添加一份到redis队列（使用rq库），达到类似“同步”、“订阅”的目的  
+  加入选项 `--dsn-dest h=host1,P=3306,u=user1,p=pass1` 来指定目标库的地址，并将`INSERT INTO`换成了`REPLACE INTO`，程序起来之后会暂存消息在队列，需要的时候执行 `rq worker` 开始在目标库消费（回放）。  
+  指定redis地址 export REDIS_URL='redis://:pass1@ip_addr1:6379/1'  
+  关于 rq 的使用请参考 https://github.com/nvie/rq  
 - 新旧库sql库名映射
   生成的sql默认与原始 binlog2sql 的schema名称相同，但当使用格式 `-d dbname1:myname2` 时，表示在源库解析到库名是 `dbname1` 时，组装sql时使用 `myname2` 代替。我有在分库且前后库名不一样时用到。
-- 修复`--stop-never`失效的问题
+- 修复`--stop-never`失效的问题  
   在我使用 `--stop-never` 时发现binlog解析到当前最新位置后，还是会退出，不会源源不断的保持监听状态（在阿里rds上使用就正常）。在`BinLogStreamReader`类实例化时加上`blocking=True`有效。
-- 修复了 `pymysqlreplication` 库里面的几个小问题
+- 修复了 `pymysqlreplication` 库里面的几个小问题  
   见 [commit#9390ded](https://github.com/seanlook/python-mysql-replication/commit/9704de222dd6c63dc490a731b127e28f5270aa0a)
 
 ========================
