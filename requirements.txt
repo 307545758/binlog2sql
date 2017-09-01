@@ -1,3 +1,5 @@
 PyMySQL==0.7.11
 wheel==0.29.0
 mysql-replication==0.13
+redis==2.10.6
+rq==0.8.1

@@ -12,10 +12,12 @@ from pymysqlreplication.row_event import (
 from pymysqlreplication.event import QueryEvent, RotateEvent, FormatDescriptionEvent
 from binlog2sql_util import command_line_args, concat_sql_from_binlogevent, create_unique_file, reversed_lines
 
+
 class Binlog2sql(object):
 
     def __init__(self, connectionSettings, startFile=None, startPos=None, endFile=None, endPos=None, startTime=None,
-                 stopTime=None, only_schemas=None, only_tables=None, nopk=False, flashback=False, stopnever=False):
+                 stopTime=None, only_schemas=None, only_tables=None, nopk=False, flashback=False, stopnever=False,
+                 recover=None):
         '''
         connectionSettings: {'host': 127.0.0.1, 'port': 3306, 'user': slave, 'passwd': slave}
         '''
@@ -30,8 +32,18 @@ class Binlog2sql(object):
         self.startTime = datetime.datetime.strptime(startTime, "%Y-%m-%d %H:%M:%S") if startTime else datetime.datetime.strptime('1970-01-01 00:00:00', "%Y-%m-%d %H:%M:%S")
         self.stopTime = datetime.datetime.strptime(stopTime, "%Y-%m-%d %H:%M:%S") if stopTime else datetime.datetime.strptime('2999-12-31 00:00:00', "%Y-%m-%d %H:%M:%S")
 
-        self.only_schemas = only_schemas if only_schemas else None
+        self.schema_map = {}  # new property to store src->dest mapped schema name
+        for schema in only_schemas:
+            if ':' in schema:
+                src_schema, dest_schema = schema.split(':')
+            else:
+                src_schema = dest_schema = schema
+            self.schema_map[src_schema] = dest_schema
+
+        self.only_schemas = list(self.schema_map.keys()) if only_schemas else None
         self.only_tables = only_tables if only_tables else None
+        self.recover = recover
+
         self.nopk, self.flashback, self.stopnever = (nopk, flashback, stopnever)
 
         self.binlogList = []
@@ -59,7 +71,7 @@ class Binlog2sql(object):
     def process_binlog(self):
         stream = BinLogStreamReader(connection_settings=self.connectionSettings, server_id=self.serverId,
                                     log_file=self.startFile, log_pos=self.startPos, only_schemas=self.only_schemas,
-                                    only_tables=self.only_tables, resume_stream=True)
+                                    only_tables=self.only_tables, resume_stream=True, date_tostr=True, blocking=True)
 
         cur = self.connection.cursor()
         tmpFile = create_unique_file('%s.%s' % (self.connectionSettings['host'],self.connectionSettings['port'])) # to simplify code, we do not use file lock for tmpFile.
@@ -83,17 +95,25 @@ class Binlog2sql(object):
                 if isinstance(binlogevent, QueryEvent) and binlogevent.query == 'BEGIN':
                     eStartPos = lastPos
 
+                # change dst schema name
+
                 if isinstance(binlogevent, QueryEvent):
+                    binlogevent.schema = self.schema_map.get(binlogevent.schema, binlogevent.schema)
                     sql = concat_sql_from_binlogevent(cursor=cur, binlogevent=binlogevent, flashback=self.flashback, nopk=self.nopk)
                     if sql:
                         print sql
+                        if self.recover:
+                            write_to_queue(sql)
                 elif isinstance(binlogevent, WriteRowsEvent) or isinstance(binlogevent, UpdateRowsEvent) or isinstance(binlogevent, DeleteRowsEvent):
+                    binlogevent.schema = self.schema_map.get(binlogevent.schema, binlogevent.schema)
                     for row in binlogevent.rows:
-                        sql = concat_sql_from_binlogevent(cursor=cur, binlogevent=binlogevent, row=row , flashback=self.flashback, nopk=self.nopk, eStartPos=eStartPos)
+                        sql = concat_sql_from_binlogevent(cursor=cur, binlogevent=binlogevent, row=row, flashback=self.flashback, nopk=self.nopk, eStartPos=eStartPos)
                         if self.flashback:
                             ftmp.write(sql + '\n')
                         else:
                             print sql
+                            if self.recover:
+                                write_to_queue(sql)
 
                 if not (isinstance(binlogevent, RotateEvent) or isinstance(binlogevent, FormatDescriptionEvent)):
                     lastPos = binlogevent.packet.log_pos
@@ -116,6 +136,8 @@ class Binlog2sql(object):
             i = 0
             for line in reversed_lines(ftmp):
                 print line.rstrip()
+                if self.recover:
+                    write_to_queue(line.rstrip())
                 if i >= sleepInterval:
                     print 'SELECT SLEEP(1);'
                     i = 0
@@ -125,13 +147,39 @@ class Binlog2sql(object):
     def __del__(self):
         pass
 
+q = None
+# dbconn = None
+dest_dbinfo = None
+def write_to_queue(sql):
+    """
+    write generated sqls to redis queue. it's usfull to stage the sqls that wait to replay or rollback
+    rq worker or worker function (@TODO)
+    """
+    q.enqueue(recover_to_db, sql, dest_dbinfo)
 
 if __name__ == '__main__':
-
+    global q
+    global dest_dbinfo
     args = command_line_args(sys.argv[1:])
+    recover = 0
+    if args.dest_dsn:
+        from binlog2sql_util import recover_to_db
+        import redis
+        from rq import Queue
+        dest_dbinfo = args.dest_dsn
+        # dest_dbinfo = args.dest_dsn
+        # dest_dbinfo['charset'] = 'utf8mb4'
+        # dbconn = pymysql.Connect(**dest_dbinfo)
+        # dbconn.autocommit(1)
+        redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
+        redis_conn = redis.from_url(redis_url)
+        q = Queue(connection=redis_conn)
+        recover = 1  # also work as a flag
+
     connectionSettings = {'host':args.host, 'port':args.port, 'user':args.user, 'passwd':args.password}
     binlog2sql = Binlog2sql(connectionSettings=connectionSettings, startFile=args.startFile,
                             startPos=args.startPos, endFile=args.endFile, endPos=args.endPos,
                             startTime=args.startTime, stopTime=args.stopTime, only_schemas=args.databases,
-                            only_tables=args.tables, nopk=args.nopk, flashback=args.flashback, stopnever=args.stopnever)
+                            only_tables=args.tables, nopk=args.nopk, flashback=args.flashback, stopnever=args.stopnever,
+                            recover=recover)
     binlog2sql.process_binlog()

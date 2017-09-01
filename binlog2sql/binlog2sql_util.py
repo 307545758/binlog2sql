@@ -10,7 +10,8 @@ from pymysqlreplication.row_event import (
     DeleteRowsEvent,
 )
 from pymysqlreplication.event import QueryEvent, RotateEvent, FormatDescriptionEvent
-
+import redis
+from rq import Queue
 
 def is_valid_datetime(string):
     try:
@@ -29,6 +30,23 @@ def create_unique_file(filename):
     if version >= 1000:
         raise OSError('cannot create unique file %s.[0-1000]' % filename)
     return resultFile
+
+def get_dbinfo_from_dsn(dsn_str):
+    DBConfig = {}
+    dsn_list = dsn_str.split(',')
+    for item in dsn_list:
+        if item.startswith('h='):
+            DBConfig['host'] = item[2:]
+        if item.startswith('P='):
+            DBConfig['port'] = int(item[2:])
+        if item.startswith('u='):
+            DBConfig['user'] = item[2:]
+        if item.startswith('p='):
+            DBConfig['password'] = item[2:]  # 加密
+    if len(DBConfig) != 4:
+        raise ValueError('please give the right format dsn, exactly like: u=host1,P=3306,u=user1,p=pass1')
+        sys.exit()
+    return DBConfig
 
 def parse_args(args):
     """parse args for binlog2sql"""
@@ -63,18 +81,21 @@ def parse_args(args):
 
     schema = parser.add_argument_group('schema filter')
     schema.add_argument('-d', '--databases', dest='databases', type=str, nargs='*',
-                        help='dbs you want to process', default='')
+                        help='dbs you want to process. use format db0:m_db0 db1:m_db1 to change dest schema name', default='')
     schema.add_argument('-t', '--tables', dest='tables', type=str, nargs='*',
-                        help='tables you want to process', default='')
+                        help='tables you want to process. use format db0.tbl0 to change dest schema name', default='')
 
     # exclusive = parser.add_mutually_exclusive_group()
     parser.add_argument('-K', '--no-primary-key', dest='nopk', action='store_true',
                            help='Generate insert sql without primary key if exists', default=False)
     parser.add_argument('-B', '--flashback', dest='flashback', action='store_true',
                            help='Flashback data to start_postition of start_file', default=False)
+    parser.add_argument('--dest-dsn', nargs=1, dest='dest_dsn', action='store',
+                           help='where to replay/flashback, format: h=host1,P=3306,u=user1,p=pass1', required=False)
     return parser
 
 def command_line_args(args):
+    global dest_dbinfo
     needPrintHelp = False if args else True
     parser = parse_args(args)
     args = parser.parse_args(args)
@@ -89,6 +110,10 @@ def command_line_args(args):
         raise ValueError('Only one of flashback or nopk can be True')
     if (args.startTime and not is_valid_datetime(args.startTime)) or (args.stopTime and not is_valid_datetime(args.stopTime)):
         raise ValueError('Incorrect datetime argument')
+    if args.dest_dsn:
+        if args.flashback:
+            raise ValueError('Only one of dest_dsn or flashback can be given')
+        args.dest_dsn = get_dbinfo_from_dsn(args.dest_dsn[0])
     return args
 
 
@@ -157,14 +182,14 @@ def generate_sql_pattern(binlogevent, row=None, flashback=False, nopk=False):
                 if binlogevent.primary_key:
                     row['values'].pop(binlogevent.primary_key)
 
-            template = 'INSERT INTO `{0}`.`{1}`({2}) VALUES ({3});'.format(
+            template = 'RELACE INTO `{0}`.`{1}`({2}) VALUES ({3});'.format(
                 binlogevent.schema, binlogevent.table,
                 ', '.join(map(lambda k: '`%s`'%k, row['values'].keys())),
                 ', '.join(['%s'] * len(row['values']))
             )
             values = map(fix_object, row['values'].values())
         elif isinstance(binlogevent, DeleteRowsEvent):
-            template ='DELETE FROM `{0}`.`{1}` WHERE {2} LIMIT 1;'.format(
+            template ='DELETE IGNORE FROM `{0}`.`{1}` WHERE {2} LIMIT 1;'.format(
                 binlogevent.schema, binlogevent.table,
                 ' AND '.join(map(compare_items, row['values'].items()))
             )
@@ -199,3 +224,15 @@ def reversed_blocks(file, blocksize=4096):
         here -= delta
         file.seek(here, os.SEEK_SET)
         yield file.read(delta)
+
+
+def recover_to_db(sql, dbinfo):
+    "run sql in target db"
+    dbinfo['charset'] = 'utf8mb4'
+    dbinfo['autocommit'] = True
+    dbconn = pymysql.Connect(**dbinfo)
+    dbconn.autocommit(1)
+
+    cur = dbconn.cursor()
+    cur.execute(sql)
+    dbconn.close()
